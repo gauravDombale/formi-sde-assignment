@@ -29,6 +29,7 @@ from dataclasses import dataclass
 
 from src.config import settings
 from src.services.circuit_breaker import circuit_breaker
+from src.services.audit import audit_logger
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,18 @@ class PostCallProcessor:
         # Note: this increments llm:postcall:rpm but doesn't check it first.
         # The check happens in circuit_breaker.check_capacity(), which is
         # called by the dialler — not here, before spending the tokens.
-        await circuit_breaker.record_postcall_start()
+        try:
+            await circuit_breaker.record_postcall_start()
+        except Exception as e:
+            audit_logger.emit(
+                "legacy_circuit_metric_failed",
+                interaction_id=ctx.interaction_id,
+                customer_id=ctx.customer_id,
+                campaign_id=ctx.campaign_id,
+                session_id=ctx.session_id,
+                error=str(e),
+                severity="warning",
+            )
 
         try:
             prompt = self._build_analysis_prompt(
@@ -146,7 +158,18 @@ class PostCallProcessor:
             raise
 
         finally:
-            await circuit_breaker.record_postcall_end()
+            try:
+                await circuit_breaker.record_postcall_end()
+            except Exception as e:
+                audit_logger.emit(
+                    "legacy_circuit_metric_failed",
+                    interaction_id=ctx.interaction_id,
+                    customer_id=ctx.customer_id,
+                    campaign_id=ctx.campaign_id,
+                    session_id=ctx.session_id,
+                    error=str(e),
+                    severity="warning",
+                )
 
     def _build_analysis_prompt(
         self,
