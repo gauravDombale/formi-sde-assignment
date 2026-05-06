@@ -39,11 +39,14 @@ from datetime import datetime
 from typing import Any, Dict
 
 from src.tasks.celery_app import celery_app
-from src.services.post_call_processor import PostCallProcessor, PostCallContext
-from src.services.recording import fetch_and_upload_recording
+from src.services.post_call_processor import PostCallContext
+from src.services.recording import poll_and_upload_recording
 from src.services.signal_jobs import trigger_signal_jobs, update_lead_stage
 from src.services.retry_queue import retry_queue
 from src.services.metrics import metrics_tracker
+from src.services.audit import audit_logger
+from src.services.llm_scheduler import llm_scheduler
+from src.services.durable_tasks import DurableTask, durable_task_store
 
 logger = logging.getLogger(__name__)
 
@@ -122,42 +125,50 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         exotel_account_id=payload.get("exotel_account_id"),
     )
 
-    # ── Step 1: Recording ─────────────────────────────────────────────────────
-    # Blocks here for ~45 seconds waiting for Exotel to make the recording
-    # available. The LLM analysis (step 2) cannot start until this completes,
-    # even though it has zero dependency on the recording.
-    #
-    # Under load, recordings often arrive in 10–15s. We wait 45s anyway.
-    # Sometimes they arrive after 60s. We've already given up by then.
-    recording_s3_key = await fetch_and_upload_recording(
-        interaction_id=ctx.interaction_id,
-        call_sid=ctx.call_sid,
-        exotel_account_id=ctx.exotel_account_id or "",
+    audit_logger.emit(
+        "postcall_processing_started",
+        interaction_id=interaction_id,
+        customer_id=ctx.customer_id,
+        campaign_id=ctx.campaign_id,
+        session_id=ctx.session_id,
     )
 
-    if recording_s3_key:
-        logger.info(
-            "recording_uploaded",
-            extra={"interaction_id": interaction_id, "s3_key": recording_s3_key},
+    # Recording upload is independent from transcript analysis. In production
+    # this is a separate durable task; local Celery execution runs both
+    # concurrently to preserve the same dependency boundary.
+    recording_task = asyncio.create_task(
+        poll_and_upload_recording(
+            interaction_id=ctx.interaction_id,
+            call_sid=ctx.call_sid,
+            exotel_account_id=ctx.exotel_account_id or "",
+            customer_id=ctx.customer_id,
+            campaign_id=ctx.campaign_id,
         )
-    # If recording_s3_key is None, we continue silently. No alert, no retry,
-    # no flag on the interaction. The recording is just gone.
+    )
 
-    # ── Step 2: LLM analysis ──────────────────────────────────────────────────
-    # Full analysis on every call. 1,500 tokens average. No pre-screening.
-    # A call where the customer said "wrong number" after one sentence gets the
-    # same treatment as a confirmed rebook.
-    #
-    # The LLM rate limit (settings.LLM_TOKENS_PER_MINUTE) is not checked before
-    # this call. If we're over the limit, the provider returns a 429 and this
-    # raises an exception, which triggers Celery retry — which goes to the back
-    # of the 100K-item queue and makes the problem worse.
-    processor = PostCallProcessor()
-    result = await processor.process_post_call(ctx, single_prompt=True)
+    scheduled = await llm_scheduler.process_when_budget_available(ctx)
+    if scheduled.status == "deferred":
+        await durable_task_store.enqueue(
+            task_id=f"analysis:{ctx.interaction_id}",
+            task_type="llm_analysis",
+            interaction_id=ctx.interaction_id,
+            customer_id=ctx.customer_id,
+            campaign_id=ctx.campaign_id,
+            payload=payload,
+            run_after_seconds=scheduled.retry_after_seconds,
+        )
+        recording_task.cancel()
+        return
+
+    result = scheduled.result
+    if result is None:
+        raise RuntimeError("analysis_completed_without_result")
 
     await metrics_tracker.track_processing_completed(
         interaction_id, result.tokens_used, result.latency_ms
     )
+
+    await asyncio.gather(recording_task, return_exceptions=True)
 
     # ── Step 3: Signal jobs ───────────────────────────────────────────────────
     # Downstream actions: send a WhatsApp follow-up, book a callback slot,
@@ -173,7 +184,15 @@ async def _process_interaction(task, payload: Dict[str, Any]):
             analysis_result=result.raw_response,
         )
     except Exception as e:
-        logger.warning("signal_jobs_failed", extra={"error": str(e)})
+        audit_logger.emit(
+            "signal_jobs_failed",
+            interaction_id=ctx.interaction_id,
+            customer_id=ctx.customer_id,
+            campaign_id=ctx.campaign_id,
+            session_id=ctx.session_id,
+            error=str(e),
+            severity="warning",
+        )
 
     # ── Step 4: Lead stage update ─────────────────────────────────────────────
     # Updates the lead's stage in the leads table based on call_stage.
@@ -186,4 +205,27 @@ async def _process_interaction(task, payload: Dict[str, Any]):
             call_stage=result.call_stage,
         )
     except Exception as e:
-        logger.warning("lead_stage_update_failed", extra={"error": str(e)})
+        audit_logger.emit(
+            "lead_stage_update_failed",
+            interaction_id=ctx.interaction_id,
+            customer_id=ctx.customer_id,
+            campaign_id=ctx.campaign_id,
+            session_id=ctx.session_id,
+            error=str(e),
+            severity="warning",
+        )
+
+
+async def process_durable_task(task: DurableTask) -> None:
+    try:
+        if task.task_type == "llm_analysis":
+            await _process_interaction(None, task.payload)
+        elif task.task_type == "recording_upload":
+            await poll_and_upload_recording(**task.payload)
+        else:
+            raise ValueError(f"unknown durable task type: {task.task_type}")
+    except Exception as e:
+        await durable_task_store.retry(task, error=str(e), delay_seconds=min(3600, 2 ** task.attempts))
+        raise
+    else:
+        await durable_task_store.complete(task)

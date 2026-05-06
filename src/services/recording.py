@@ -27,15 +27,103 @@ reads the transcript text, not the audio. There's no reason they have to run
 sequentially. What would need to change for them to run in parallel?
 """
 
-import asyncio
 import logging
+import random
+import asyncio
+from dataclasses import dataclass
 from typing import Optional
 
 import httpx
 
 from src.config import settings
+from src.services.audit import audit_logger
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RecordingPollConfig:
+    max_attempts: int = 8
+    initial_delay_seconds: float = 2
+    max_delay_seconds: float = 30
+    jitter_ratio: float = 0.10
+
+
+async def poll_and_upload_recording(
+    interaction_id: str,
+    call_sid: str,
+    exotel_account_id: str,
+    customer_id: Optional[str] = None,
+    campaign_id: Optional[str] = None,
+    config: RecordingPollConfig = RecordingPollConfig(),
+) -> Optional[str]:
+    """
+    Poll Exotel until the recording is ready, then upload it to S3.
+
+    Returns the S3 key on success, None on failure or timeout.
+    """
+    delay = config.initial_delay_seconds
+
+    for attempt in range(1, config.max_attempts + 1):
+        audit_logger.emit(
+            "recording_poll_attempt",
+            interaction_id=interaction_id,
+            customer_id=customer_id,
+            campaign_id=campaign_id,
+            call_sid=call_sid,
+            attempt=attempt,
+        )
+
+        try:
+            recording_url = await _fetch_exotel_recording_url(call_sid, exotel_account_id)
+            if recording_url:
+                s3_key = await _upload_to_s3(recording_url, interaction_id)
+                audit_logger.emit(
+                    "recording_uploaded",
+                    interaction_id=interaction_id,
+                    customer_id=customer_id,
+                    campaign_id=campaign_id,
+                    call_sid=call_sid,
+                    s3_key=s3_key,
+                    attempt=attempt,
+                )
+                return s3_key
+
+            audit_logger.emit(
+                "recording_not_ready",
+                interaction_id=interaction_id,
+                customer_id=customer_id,
+                campaign_id=campaign_id,
+                call_sid=call_sid,
+                attempt=attempt,
+                next_delay_seconds=delay if attempt < config.max_attempts else None,
+            )
+        except Exception as e:
+            audit_logger.emit(
+                "recording_poll_error",
+                interaction_id=interaction_id,
+                customer_id=customer_id,
+                campaign_id=campaign_id,
+                call_sid=call_sid,
+                attempt=attempt,
+                error=str(e),
+                severity="error",
+            )
+
+        if attempt < config.max_attempts:
+            await asyncio.sleep(_with_jitter(delay, config.jitter_ratio))
+            delay = min(config.max_delay_seconds, delay * 2)
+
+    audit_logger.emit(
+        "recording_upload_failed",
+        interaction_id=interaction_id,
+        customer_id=customer_id,
+        campaign_id=campaign_id,
+        call_sid=call_sid,
+        attempts=config.max_attempts,
+        severity="error",
+    )
+    return None
 
 
 async def fetch_and_upload_recording(
@@ -43,52 +131,12 @@ async def fetch_and_upload_recording(
     call_sid: str,
     exotel_account_id: str,
 ) -> Optional[str]:
-    """
-    Attempt to fetch the Exotel recording and upload it to S3.
-
-    Current implementation: sleep 45s, try once, return None on failure.
-    Failure is logged at DEBUG level — effectively invisible in production
-    where the log level is INFO.
-
-    Returns the S3 key on success, None on failure or timeout.
-    """
-
-    # This sleep blocks the entire Celery task. While we're sleeping here,
-    # the LLM quota is sitting idle, the analysis hasn't started, and the
-    # dashboard still shows "processing" for what might be a confirmed rebook
-    # that the sales team is waiting to act on.
-    await asyncio.sleep(settings.RECORDING_WAIT_SECONDS)
-
-    try:
-        recording_url = await _fetch_exotel_recording_url(call_sid, exotel_account_id)
-
-        if not recording_url:
-            # Not available after 45s. We move on. No record that we tried.
-            # An ops engineer investigating "why is there no recording for
-            # interaction X?" has no log entry to find.
-            logger.debug(
-                "recording_not_available",
-                extra={
-                    "interaction_id": interaction_id,
-                    "call_sid": call_sid,
-                    "waited_seconds": settings.RECORDING_WAIT_SECONDS,
-                },
-            )
-            return None
-
-        s3_key = await _upload_to_s3(recording_url, interaction_id)
-        return s3_key
-
-    except Exception as e:
-        # Exception is caught here and swallowed. The caller (Celery task)
-        # doesn't know whether this succeeded, failed, or was skipped.
-        # It logs at ERROR level, which is at least visible — but there's
-        # no retry path and no way to replay just the recording upload later.
-        logger.exception(
-            "recording_upload_error",
-            extra={"interaction_id": interaction_id, "error": str(e)},
-        )
-        return None
+    """Backward-compatible wrapper for callers not yet migrated."""
+    return await poll_and_upload_recording(
+        interaction_id=interaction_id,
+        call_sid=call_sid,
+        exotel_account_id=exotel_account_id,
+    )
 
 
 async def _fetch_exotel_recording_url(
@@ -133,3 +181,10 @@ async def _upload_to_s3(recording_url: str, interaction_id: str) -> str:
         extra={"interaction_id": interaction_id, "s3_key": s3_key},
     )
     return s3_key
+
+
+def _with_jitter(delay: float, jitter_ratio: float) -> float:
+    if jitter_ratio <= 0:
+        return delay
+    spread = delay * jitter_ratio
+    return max(0, delay + random.uniform(-spread, spread))
