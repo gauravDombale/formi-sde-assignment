@@ -82,7 +82,7 @@ CREATE INDEX idx_interactions_status ON interactions(status);
 -- Durable post-call workflow state. Workers claim rows with SELECT ... FOR
 -- UPDATE SKIP LOCKED, so a Redis/Celery restart cannot permanently lose work.
 CREATE TABLE postcall_tasks (
-    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    id VARCHAR(255) PRIMARY KEY,
     interaction_id UUID NOT NULL REFERENCES interactions(id),
     customer_id UUID NOT NULL,
     campaign_id UUID NOT NULL,

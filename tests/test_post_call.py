@@ -10,6 +10,7 @@ from src.services.llm_scheduler import (
     TokenBudgetManager,
     classify_processing_lane,
 )
+from src.services.durable_tasks import PostgresDurableTaskStore
 from src.services.post_call_processor import AnalysisResult
 from src.services.recording import RecordingPollConfig, poll_and_upload_recording
 
@@ -23,6 +24,47 @@ class ManualClock:
 
     def advance(self, seconds: float):
         self.now += seconds
+
+
+class FakeResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def mappings(self):
+        return self
+
+    def all(self):
+        return self._rows
+
+    def one(self):
+        return self._rows[0]
+
+
+class FakeSession:
+    def __init__(self, rows):
+        self.rows = rows
+        self.executed = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def begin(self):
+        return self
+
+    async def execute(self, statement, params=None):
+        self.executed.append((str(statement), params or {}))
+        return FakeResult(self.rows)
+
+
+class FakeSessionFactory:
+    def __init__(self, rows):
+        self.session = FakeSession(rows)
+
+    def __call__(self):
+        return self.session
 
 
 @pytest.mark.asyncio
@@ -162,3 +204,73 @@ async def test_audit_events_include_interaction_id(make_post_call_context, caplo
     events = [record for record in caplog.records if record.name == "postcall.audit"]
     assert events
     assert all(getattr(record, "interaction_id", None) == "audit-interaction" for record in events)
+
+
+@pytest.mark.asyncio
+async def test_postgres_durable_store_claims_with_skip_locked():
+    factory = FakeSessionFactory(
+        [
+            {
+                "id": "analysis:interaction-1",
+                "task_type": "llm_analysis",
+                "interaction_id": "interaction-1",
+                "customer_id": "customer-1",
+                "campaign_id": "campaign-1",
+                "payload": {"interaction_id": "interaction-1"},
+                "status": "running",
+                "attempts": 1,
+                "max_attempts": 10,
+                "last_error": None,
+                "next_run_at_epoch": 123,
+            }
+        ]
+    )
+    store = PostgresDurableTaskStore(session_factory=factory, worker_id="worker-a")
+
+    tasks = await store.claim_ready(limit=5)
+
+    sql, params = factory.session.executed[0]
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "locked_until = NOW()" in sql
+    assert params["worker_id"] == "worker-a"
+    assert tasks[0].id == "analysis:interaction-1"
+    assert tasks[0].status.value == "running"
+
+
+@pytest.mark.asyncio
+async def test_postgres_durable_store_enqueue_uses_idempotent_task_key():
+    factory = FakeSessionFactory(
+        [
+            {
+                "id": "analysis:interaction-2",
+                "task_type": "llm_analysis",
+                "interaction_id": "interaction-2",
+                "customer_id": "customer-1",
+                "campaign_id": "campaign-1",
+                "payload": {"interaction_id": "interaction-2"},
+                "status": "queued",
+                "attempts": 0,
+                "max_attempts": 10,
+                "last_error": None,
+                "next_run_at_epoch": 456,
+            }
+        ]
+    )
+    store = PostgresDurableTaskStore(session_factory=factory)
+
+    task = await store.enqueue(
+        task_id="analysis:interaction-2",
+        task_type="llm_analysis",
+        interaction_id="interaction-2",
+        customer_id="customer-1",
+        campaign_id="campaign-1",
+        payload={"interaction_id": "interaction-2"},
+        lane=ProcessingLane.HOT,
+    )
+
+    sql, params = factory.session.executed[0]
+    assert "ON CONFLICT (id) DO UPDATE" in sql
+    assert "CAST(:payload_json AS jsonb)" in sql
+    assert params["task_id"] == "analysis:interaction-2"
+    assert params["lane"] == "hot"
+    assert task.id == "analysis:interaction-2"

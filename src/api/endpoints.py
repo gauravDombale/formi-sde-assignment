@@ -138,6 +138,7 @@ async def end_interaction(
             customer_id=interaction["customer_id"],
             campaign_id=interaction["campaign_id"],
             payload=celery_payload,
+            lane=lane,
         )
         await durable_task_store.enqueue(
             task_id=f"recording:{interaction_id}",
@@ -213,10 +214,10 @@ async def _load_interaction(interaction_id: UUID) -> Optional[Dict[str, Any]]:
     # Mock — returns a realistic sample for local development
     return {
         "id": str(interaction_id),
-        "lead_id": "mock-lead-id",
-        "campaign_id": "mock-campaign-id",
-        "customer_id": "mock-customer-id",
-        "agent_id": "mock-agent-id",
+        "lead_id": "a0000000-0000-0000-0000-000000000001",
+        "campaign_id": "c0000000-0000-0000-0000-000000000001",
+        "customer_id": "d0000000-0000-0000-0000-000000000001",
+        "agent_id": "e0000000-0000-0000-0000-000000000001",
         "exotel_account_id": "mock-exotel-account",
         "conversation_data": {
             "transcript": [

@@ -156,6 +156,7 @@ async def _process_interaction(task, payload: Dict[str, Any]):
             campaign_id=ctx.campaign_id,
             payload=payload,
             run_after_seconds=scheduled.retry_after_seconds,
+            lane=scheduled.lane,
         )
         recording_task.cancel()
         return
@@ -229,3 +230,33 @@ async def process_durable_task(task: DurableTask) -> None:
         raise
     else:
         await durable_task_store.complete(task)
+
+
+async def drain_due_durable_tasks(batch_size: int = 50) -> int:
+    tasks = await durable_task_store.claim_ready(limit=batch_size)
+    processed = 0
+    for durable_task in tasks:
+        try:
+            await process_durable_task(durable_task)
+        except Exception:
+            logger.exception(
+                "durable_task_processing_failed",
+                extra={
+                    "interaction_id": durable_task.interaction_id,
+                    "task_id": durable_task.id,
+                    "task_type": durable_task.task_type,
+                },
+            )
+        finally:
+            processed += 1
+    return processed
+
+
+@celery_app.task(name="drain_due_postcall_tasks", bind=True, queue="postcall_processing")
+def drain_due_postcall_tasks(self, batch_size: int = 50):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(drain_due_durable_tasks(batch_size=batch_size))
+    finally:
+        loop.close()

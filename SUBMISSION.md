@@ -93,6 +93,8 @@ Durability comes from Postgres tables:
 
 Workers use row locks with `FOR UPDATE SKIP LOCKED`. If a worker dies, `locked_until` expires and another worker can reclaim the task. Dead-lettered tasks retain payload and error for replay; they are not dropped.
 
+The implementation includes `PostgresDurableTaskStore`, which performs idempotent enqueue by semantic task key, claims ready rows with `FOR UPDATE SKIP LOCKED`, sets `locked_by`/`locked_until` during claim, and exposes `complete`/`retry` transitions. Celery is retained only as a wake-up mechanism through `drain_due_postcall_tasks`; the replayable source of truth is Postgres.
+
 ## 9. Auditability & Observability
 
 Every structured event includes:
@@ -151,12 +153,12 @@ The external webhook contract is unchanged. Internally, the endpoint now writes 
 
 ## 14. Known Weaknesses
 
-The local implementation uses an in-process budget manager and in-memory durable store for testability. Production needs SQL-backed atomic counters or Redis Lua scripts plus the Postgres ledger. The current hot/cold classifier is heuristic and should become customer-configurable. Downstream CRM/signal jobs still need the same durable task treatment as analysis and recordings.
+The local tests still use an in-process budget manager for deterministic rate-limit simulation. Production should back token reservations with atomic SQL updates or Redis Lua scripts plus the Postgres ledger. The current hot/cold classifier is heuristic and should become customer-configurable. Downstream CRM/signal jobs still need the same durable task treatment as analysis and recordings.
 
 ## 15. What I Would Do With More Time
 
-1. Implement the SQL worker loop with `FOR UPDATE SKIP LOCKED` and stale-lock recovery.
-2. Add transcript-size-based token estimation instead of a flat average.
-3. Persist audit events directly to `postcall_audit_events`, not just structured logs.
-4. Move signal jobs and CRM pushes into `postcall_tasks`.
-5. Add dashboards for queue depth, hot-lane SLA, token burn, and recording failures.
+1. Add transcript-size-based token estimation instead of a flat average.
+2. Persist audit events directly to `postcall_audit_events`, not just structured logs.
+3. Move signal jobs and CRM pushes into `postcall_tasks`.
+4. Add dashboards for queue depth, hot-lane SLA, token burn, and recording failures.
+5. Add an integration test against real Postgres that kills a worker after claim and verifies stale-lock recovery.
