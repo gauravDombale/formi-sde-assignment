@@ -1,114 +1,164 @@
-"""
-Tests for the current post-call processing system.
-
-These tests document the EXISTING behaviour — including its problems.
-Your solution should make these tests obsolete and replace them with
-tests that validate the new architecture.
-"""
+from unittest.mock import AsyncMock, patch
 
 import pytest
-from unittest.mock import AsyncMock, patch, MagicMock
-from datetime import datetime
 
-from src.services.post_call_processor import PostCallProcessor, PostCallContext
+from src.config import settings
+from src.services.llm_scheduler import (
+    CustomerBudget,
+    LLMRequestScheduler,
+    ProcessingLane,
+    TokenBudgetManager,
+    classify_processing_lane,
+)
+from src.services.post_call_processor import AnalysisResult
+from src.services.recording import RecordingPollConfig, poll_and_upload_recording
 
 
-@pytest.mark.asyncio
-async def test_every_call_gets_full_llm_analysis(make_post_call_context):
-    """
-    CURRENT BEHAVIOUR: Even a clear "not interested" call gets full LLM analysis.
-    This is the core inefficiency — there is no triage step.
-    """
-    ctx = make_post_call_context("not_interested")
-    processor = PostCallProcessor()
+class ManualClock:
+    def __init__(self):
+        self.now = 0.0
 
-    with patch.object(processor, "_call_llm", new_callable=AsyncMock) as mock_llm:
-        mock_llm.return_value = {
-            "call_stage": "not_interested",
-            "entities": {},
-            "summary": "Customer not interested",
-            "usage": {"total_tokens": 1200},
-        }
+    def __call__(self):
+        return self.now
 
-        with patch.object(processor, "_update_interaction_metadata", new_callable=AsyncMock):
-            result = await processor.process_post_call(ctx)
-
-        # LLM was called — even though the transcript clearly says "not interested"
-        mock_llm.assert_called_once()
-        assert result.tokens_used == 1200
+    def advance(self, seconds: float):
+        self.now += seconds
 
 
 @pytest.mark.asyncio
-async def test_rebook_gets_same_priority_as_not_interested(make_post_call_context):
-    """
-    CURRENT BEHAVIOUR: A high-value rebook confirmation has zero priority
-    over a "not interested" call. Both sit in the same Celery queue.
-    """
-    rebook_ctx = make_post_call_context("rebook_confirmed")
-    not_interested_ctx = make_post_call_context("not_interested")
+async def test_scheduler_never_exceeds_global_rate_limits(make_post_call_context):
+    clock = ManualClock()
+    budget = TokenBudgetManager(
+        total_tokens_per_minute=3_000,
+        total_requests_per_minute=2,
+        window_seconds=60,
+        clock=clock,
+    )
+    processor = AsyncMock()
+    processor.process_post_call = AsyncMock(
+        return_value=AnalysisResult(
+            call_stage="demo_booked",
+            entities={},
+            summary="ok",
+            raw_response={"call_stage": "demo_booked"},
+            tokens_used=1_500,
+            latency_ms=10,
+            provider=settings.LLM_PROVIDER,
+            model=settings.LLM_MODEL,
+        )
+    )
+    scheduler = LLMRequestScheduler(budget, processor=processor, estimated_tokens_per_call=1_500)
 
-    # Both would be enqueued to the same "postcall_processing" queue
-    # with no priority differentiation
-    assert True  # Documenting the absence of prioritisation
+    results = []
+    for i in range(5):
+        ctx = make_post_call_context("demo_booked", interaction_id=f"interaction-{i}")
+        results.append(await scheduler.process_when_budget_available(ctx))
+
+    assert [result.status for result in results].count("completed") == 2
+    assert [result.status for result in results].count("deferred") == 3
+    assert processor.process_post_call.await_count == 2
 
 
-@pytest.mark.asyncio
-async def test_short_transcript_detected():
-    """
-    CURRENT BEHAVIOUR: Short transcripts ARE detected, but only at the
-    FastAPI endpoint level. If the detection fails or the logic changes,
-    short calls still enter the Celery queue.
-    """
-    ctx = PostCallContext(
-        interaction_id="test-001",
-        session_id="test-session",
-        lead_id="test-lead",
-        campaign_id="test-campaign",
-        customer_id="test-customer",
-        agent_id="test-agent",
-        call_sid="test-call",
-        transcript_text="agent: Hello\ncustomer: Wrong number",
-        conversation_data={"transcript": [
-            {"role": "agent", "content": "Hello"},
-            {"role": "customer", "content": "Wrong number"},
-        ]},
-        additional_data={},
-        ended_at=datetime.utcnow(),
+def test_customer_a_cannot_consume_customer_b_reserved_budget():
+    clock = ManualClock()
+    budget = TokenBudgetManager(
+        total_tokens_per_minute=100,
+        total_requests_per_minute=100,
+        customer_budgets=[
+            CustomerBudget("customer-a", reserved_tokens_per_minute=20),
+            CustomerBudget("customer-b", reserved_tokens_per_minute=80),
+        ],
+        clock=clock,
     )
 
-    # Short transcript detection exists but is fragile
-    transcript = ctx.conversation_data.get("transcript", [])
-    is_short = len(transcript) < 4
-    assert is_short is True
+    assert budget.acquire(customer_id="customer-a", estimated_tokens=20).allowed
+    assert not budget.acquire(customer_id="customer-a", estimated_tokens=1).allowed
+    assert budget.acquire(customer_id="customer-b", estimated_tokens=80).allowed
 
 
 @pytest.mark.asyncio
-async def test_recording_blocks_processing(make_post_call_context):
-    """
-    CURRENT BEHAVIOUR: Recording upload blocks for 45 seconds before
-    LLM analysis can start, even if the recording is available immediately
-    or won't be available at all.
-    """
-    # The asyncio.sleep(45) in recording.py means every call waits 45s
-    # before any LLM analysis begins, regardless of recording availability.
-    # This test documents the coupling — recording should not block analysis.
-    assert True  # Documenting the 45s blocking sleep
+async def test_short_transcripts_skip_llm(make_post_call_context):
+    budget = TokenBudgetManager(total_tokens_per_minute=10_000, total_requests_per_minute=100)
+    processor = AsyncMock()
+    processor._update_interaction_metadata = AsyncMock()
+    processor.process_post_call = AsyncMock()
+    scheduler = LLMRequestScheduler(budget, processor=processor)
+
+    ctx = make_post_call_context("short_call_hangup")
+    result = await scheduler.process_when_budget_available(ctx)
+
+    assert result.status == "completed"
+    assert result.lane == ProcessingLane.SKIP
+    assert result.result.tokens_used == 0
+    processor.process_post_call.assert_not_called()
+    processor._update_interaction_metadata.assert_awaited_once()
+
+
+def test_processing_lane_uses_business_urgency(make_post_call_context):
+    assert classify_processing_lane(make_post_call_context("rebook_confirmed")) == ProcessingLane.HOT
+    assert classify_processing_lane(make_post_call_context("demo_booked")) == ProcessingLane.HOT
+    assert classify_processing_lane(make_post_call_context("escalation_needed")) == ProcessingLane.HOT
+    assert classify_processing_lane(make_post_call_context("not_interested")) == ProcessingLane.COLD
+    assert classify_processing_lane(make_post_call_context("short_call_hangup")) == ProcessingLane.SKIP
 
 
 @pytest.mark.asyncio
-async def test_circuit_breaker_freezes_dialler():
-    """
-    CURRENT BEHAVIOUR: When post-call LLM usage >= 90%, the circuit breaker
-    freezes ALL outbound dialling for the agent for 1800 seconds.
-    No gradual backpressure, no per-campaign granularity.
-    """
-    from src.services.circuit_breaker import PostCallCircuitBreaker
+async def test_recording_poller_retries_until_recording_is_ready():
+    attempts = 0
 
-    breaker = PostCallCircuitBreaker()
-    breaker._capacity_threshold = 0.90
-    breaker._freeze_seconds = 1800
+    async def fake_fetch(call_sid: str, account_id: str):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 3:
+            return "https://recording.example/call.mp3"
+        return None
 
-    # If we could mock Redis to return RPM at 91% of max,
-    # the breaker would trip and freeze ALL calls for that agent
-    assert breaker._freeze_seconds == 1800
-    assert breaker._capacity_threshold == 0.90
+    with patch("src.services.recording._fetch_exotel_recording_url", new=fake_fetch), patch(
+        "src.services.recording._upload_to_s3", new=AsyncMock(return_value="recordings/abc.mp3")
+    ) as upload, patch("src.services.recording.asyncio.sleep", new=AsyncMock()):
+        s3_key = await poll_and_upload_recording(
+            interaction_id="abc",
+            call_sid="call-1",
+            exotel_account_id="account-1",
+            config=RecordingPollConfig(max_attempts=4, initial_delay_seconds=1, jitter_ratio=0),
+        )
+
+    assert attempts == 3
+    assert s3_key == "recordings/abc.mp3"
+    upload.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_recording_poller_logs_terminal_failure(caplog):
+    with patch("src.services.recording._fetch_exotel_recording_url", new=AsyncMock(return_value=None)), patch(
+        "src.services.recording.asyncio.sleep", new=AsyncMock()
+    ):
+        result = await poll_and_upload_recording(
+            interaction_id="missing-recording",
+            call_sid="call-2",
+            exotel_account_id="account-1",
+            config=RecordingPollConfig(max_attempts=2, initial_delay_seconds=1, jitter_ratio=0),
+        )
+
+    assert result is None
+    assert any(
+        record.getMessage() == "recording_upload_failed"
+        and getattr(record, "interaction_id", None) == "missing-recording"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_audit_events_include_interaction_id(make_post_call_context, caplog):
+    caplog.set_level("INFO", logger="postcall.audit")
+    budget = TokenBudgetManager(total_tokens_per_minute=1, total_requests_per_minute=100)
+    processor = AsyncMock()
+    scheduler = LLMRequestScheduler(budget, processor=processor, estimated_tokens_per_call=1_500)
+
+    ctx = make_post_call_context("demo_booked", interaction_id="audit-interaction")
+    result = await scheduler.process_when_budget_available(ctx)
+
+    assert result.status == "deferred"
+    events = [record for record in caplog.records if record.name == "postcall.audit"]
+    assert events
+    assert all(getattr(record, "interaction_id", None) == "audit-interaction" for record in events)
