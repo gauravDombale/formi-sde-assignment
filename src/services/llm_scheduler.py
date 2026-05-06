@@ -1,3 +1,4 @@
+import inspect
 import math
 import time
 from dataclasses import dataclass
@@ -5,10 +6,14 @@ from enum import Enum
 from typing import Dict, Iterable, Optional
 from uuid import uuid4
 
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
 from src.config import settings
 from src.services.audit import audit_logger
 from src.services.customer_policy import CustomerProcessingPolicy, policy_from_additional_data
 from src.services.post_call_processor import AnalysisResult, PostCallContext, PostCallProcessor
+from src.utils.db import async_session_factory
 
 
 class ProcessingLane(str, Enum):
@@ -76,6 +81,8 @@ class TokenBudgetManager:
         customer_id: str,
         estimated_tokens: int,
         estimated_requests: int = 1,
+        campaign_id: Optional[str] = None,
+        interaction_id: Optional[str] = None,
     ) -> BudgetDecision:
         window_id = self._window_id()
         self._ensure_window(window_id)
@@ -166,6 +173,201 @@ class TokenBudgetManager:
         return self.window_seconds - (self._clock() % self.window_seconds)
 
 
+class PostgresTokenBudgetManager:
+    """
+    SQL-backed LLM budget manager.
+
+    Reservations are serialized per provider/model/window using an advisory
+    transaction lock, then written to llm_usage_ledger before the LLM request is
+    allowed to run. This makes rate-limit admission durable and auditable.
+    """
+
+    def __init__(
+        self,
+        total_tokens_per_minute: int,
+        total_requests_per_minute: int,
+        session_factory: async_sessionmaker[AsyncSession] = async_session_factory,
+        provider: str = settings.LLM_PROVIDER,
+        model: str = settings.LLM_MODEL,
+    ):
+        self.total_tokens_per_minute = total_tokens_per_minute
+        self.total_requests_per_minute = total_requests_per_minute
+        self._session_factory = session_factory
+        self._provider = provider
+        self._model = model
+
+    async def acquire(
+        self,
+        *,
+        customer_id: str,
+        campaign_id: str,
+        interaction_id: str,
+        estimated_tokens: int,
+        estimated_requests: int = 1,
+    ) -> BudgetDecision:
+        reservation_id = str(uuid4())
+        async with self._session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    text(
+                        """
+                        SELECT pg_advisory_xact_lock(
+                            hashtext(:provider || ':' || :model || ':' || date_trunc('minute', NOW())::text)
+                        )
+                        """
+                    ),
+                    {"provider": self._provider, "model": self._model},
+                )
+                usage = (
+                    await session.execute(
+                        text(
+                            """
+                            WITH current_window AS (
+                                SELECT date_trunc('minute', NOW()) AS window_start
+                            ),
+                            customer_usage AS (
+                                SELECT
+                                    customer_id,
+                                    COALESCE(SUM(GREATEST(actual_tokens, estimated_tokens)), 0)::int AS tokens_used,
+                                    COALESCE(SUM(request_count), 0)::int AS requests_used
+                                FROM llm_usage_ledger, current_window
+                                WHERE provider = :provider
+                                  AND model = :model
+                                  AND window_start = current_window.window_start
+                                  AND status IN ('reserved', 'completed')
+                                GROUP BY customer_id
+                            ),
+                            protected_budget AS (
+                                SELECT COALESCE(
+                                    SUM(GREATEST(b.reserved_tokens_per_minute - COALESCE(u.tokens_used, 0), 0)),
+                                    0
+                                )::int AS protected_tokens
+                                FROM customer_llm_budgets b
+                                LEFT JOIN customer_usage u ON u.customer_id = b.customer_id
+                                WHERE b.customer_id <> CAST(:customer_id AS uuid)
+                            )
+                            SELECT
+                                COALESCE((SELECT SUM(tokens_used) FROM customer_usage), 0)::int AS total_tokens_used,
+                                COALESCE((SELECT SUM(requests_used) FROM customer_usage), 0)::int AS total_requests_used,
+                                (SELECT protected_tokens FROM protected_budget) AS protected_tokens,
+                                EXTRACT(EPOCH FROM (
+                                    date_trunc('minute', NOW()) + INTERVAL '1 minute' - NOW()
+                                ))::float AS retry_after_seconds,
+                                (SELECT window_start FROM current_window) AS window_start
+                            """
+                        ),
+                        {
+                            "provider": self._provider,
+                            "model": self._model,
+                            "customer_id": customer_id,
+                        },
+                    )
+                ).mappings().one()
+
+                if estimated_tokens > self.total_tokens_per_minute:
+                    return BudgetDecision(
+                        False,
+                        usage["retry_after_seconds"],
+                        "request_exceeds_total_token_capacity",
+                    )
+
+                if usage["total_requests_used"] + estimated_requests > self.total_requests_per_minute:
+                    return BudgetDecision(False, usage["retry_after_seconds"], "global_rpm_exhausted")
+
+                available_tokens = (
+                    self.total_tokens_per_minute
+                    - usage["total_tokens_used"]
+                    - usage["protected_tokens"]
+                )
+                if estimated_tokens > available_tokens:
+                    return BudgetDecision(
+                        False,
+                        usage["retry_after_seconds"],
+                        "customer_or_global_tpm_exhausted",
+                    )
+
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO llm_usage_ledger (
+                            interaction_id,
+                            customer_id,
+                            campaign_id,
+                            provider,
+                            model,
+                            reservation_id,
+                            estimated_tokens,
+                            actual_tokens,
+                            request_count,
+                            status,
+                            window_start
+                        )
+                        VALUES (
+                            :interaction_id,
+                            :customer_id,
+                            :campaign_id,
+                            :provider,
+                            :model,
+                            :reservation_id,
+                            :estimated_tokens,
+                            0,
+                            :request_count,
+                            'reserved',
+                            :window_start
+                        )
+                        """
+                    ),
+                    {
+                        "interaction_id": interaction_id,
+                        "customer_id": customer_id,
+                        "campaign_id": campaign_id,
+                        "provider": self._provider,
+                        "model": self._model,
+                        "reservation_id": reservation_id,
+                        "estimated_tokens": estimated_tokens,
+                        "request_count": estimated_requests,
+                        "window_start": usage["window_start"],
+                    },
+                )
+
+        return BudgetDecision(True, reservation_id=reservation_id)
+
+    async def commit(self, reservation_id: str, *, actual_tokens: int) -> None:
+        async with self._session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    text(
+                        """
+                        UPDATE llm_usage_ledger
+                        SET actual_tokens = :actual_tokens,
+                            status = 'completed',
+                            completed_at = NOW()
+                        WHERE reservation_id = CAST(:reservation_id AS uuid)
+                        """
+                    ),
+                    {
+                        "reservation_id": reservation_id,
+                        "actual_tokens": actual_tokens,
+                    },
+                )
+
+    async def release(self, reservation_id: str) -> None:
+        async with self._session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    text(
+                        """
+                        UPDATE llm_usage_ledger
+                        SET status = 'released',
+                            completed_at = NOW()
+                        WHERE reservation_id = CAST(:reservation_id AS uuid)
+                          AND status = 'reserved'
+                        """
+                    ),
+                    {"reservation_id": reservation_id},
+                )
+
+
 @dataclass
 class ScheduledAnalysis:
     interaction_id: str
@@ -238,9 +440,13 @@ class LLMRequestScheduler:
             )
             return ScheduledAnalysis(ctx.interaction_id, lane, "completed", result=result)
 
-        decision = self.budget_manager.acquire(
-            customer_id=ctx.customer_id,
-            estimated_tokens=self.estimated_tokens_per_call,
+        decision = await _maybe_await(
+            self.budget_manager.acquire(
+                customer_id=ctx.customer_id,
+                campaign_id=ctx.campaign_id,
+                interaction_id=ctx.interaction_id,
+                estimated_tokens=self.estimated_tokens_per_call,
+            )
         )
         if not decision.allowed:
             audit_logger.emit(
@@ -273,7 +479,7 @@ class LLMRequestScheduler:
         try:
             result = await self.processor.process_post_call(ctx, single_prompt=True)
         except Exception:
-            self.budget_manager.release(decision.reservation_id or "")
+            await _maybe_await(self.budget_manager.release(decision.reservation_id or ""))
             audit_logger.emit(
                 "analysis_failed",
                 interaction_id=ctx.interaction_id,
@@ -284,7 +490,12 @@ class LLMRequestScheduler:
             )
             raise
 
-        self.budget_manager.commit(decision.reservation_id or "", actual_tokens=result.tokens_used)
+        await _maybe_await(
+            self.budget_manager.commit(
+                decision.reservation_id or "",
+                actual_tokens=result.tokens_used,
+            )
+        )
         audit_logger.emit(
             "analysis_completed",
             interaction_id=ctx.interaction_id,
@@ -298,7 +509,13 @@ class LLMRequestScheduler:
         return ScheduledAnalysis(ctx.interaction_id, lane, "completed", result=result)
 
 
-default_budget_manager = TokenBudgetManager(
+async def _maybe_await(value):
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+default_budget_manager = PostgresTokenBudgetManager(
     total_tokens_per_minute=settings.LLM_TOKENS_PER_MINUTE,
     total_requests_per_minute=settings.LLM_REQUESTS_PER_MINUTE,
 )

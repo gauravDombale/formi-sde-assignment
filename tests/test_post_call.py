@@ -9,10 +9,12 @@ from src.services.customer_policy import CustomerProcessingPolicy
 from src.services.llm_scheduler import (
     CustomerBudget,
     LLMRequestScheduler,
+    PostgresTokenBudgetManager,
     ProcessingLane,
     TokenBudgetManager,
     classify_processing_lane,
 )
+from src.services.audit import PostgresAuditEventWriter
 from src.services.durable_tasks import DurableTask, DurableTaskStatus, PostgresDurableTaskStore
 from src.services.post_call_processor import AnalysisResult
 from src.services.recording import RecordingPollConfig, poll_and_upload_recording
@@ -67,6 +69,34 @@ class FakeSession:
 class FakeSessionFactory:
     def __init__(self, rows):
         self.session = FakeSession(rows)
+
+    def __call__(self):
+        return self.session
+
+
+class SequenceFakeSession:
+    def __init__(self, result_batches):
+        self.result_batches = list(result_batches)
+        self.executed = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def begin(self):
+        return self
+
+    async def execute(self, statement, params=None):
+        self.executed.append((str(statement), params or {}))
+        rows = self.result_batches.pop(0) if self.result_batches else []
+        return FakeResult(rows)
+
+
+class SequenceFakeSessionFactory:
+    def __init__(self, result_batches):
+        self.session = SequenceFakeSession(result_batches)
 
     def __call__(self):
         return self.session
@@ -286,6 +316,101 @@ async def test_postgres_durable_store_enqueue_uses_idempotent_task_key():
     assert params["task_id"] == "analysis:interaction-2"
     assert params["lane"] == "hot"
     assert task.id == "analysis:interaction-2"
+
+
+@pytest.mark.asyncio
+async def test_postgres_token_budget_manager_reserves_with_advisory_lock():
+    factory = SequenceFakeSessionFactory(
+        [
+            [],
+            [
+                {
+                    "total_tokens_used": 0,
+                    "total_requests_used": 0,
+                    "protected_tokens": 0,
+                    "retry_after_seconds": 42,
+                    "window_start": "2026-05-06T10:00:00Z",
+                }
+            ],
+            [],
+        ]
+    )
+    manager = PostgresTokenBudgetManager(
+        total_tokens_per_minute=10_000,
+        total_requests_per_minute=100,
+        session_factory=factory,
+    )
+
+    decision = await manager.acquire(
+        customer_id="d0000000-0000-0000-0000-000000000001",
+        campaign_id="c0000000-0000-0000-0000-000000000001",
+        interaction_id="f0000000-0000-0000-0000-000000000001",
+        estimated_tokens=1_500,
+    )
+
+    assert decision.allowed is True
+    assert decision.reservation_id
+    executed_sql = "\n".join(sql for sql, _ in factory.session.executed)
+    assert "pg_advisory_xact_lock" in executed_sql
+    assert "INSERT INTO llm_usage_ledger" in executed_sql
+    assert factory.session.executed[-1][1]["estimated_tokens"] == 1_500
+
+
+@pytest.mark.asyncio
+async def test_postgres_token_budget_manager_defers_when_protected_budget_blocks():
+    factory = SequenceFakeSessionFactory(
+        [
+            [],
+            [
+                {
+                    "total_tokens_used": 2_000,
+                    "total_requests_used": 1,
+                    "protected_tokens": 7_000,
+                    "retry_after_seconds": 30,
+                    "window_start": "2026-05-06T10:00:00Z",
+                }
+            ],
+        ]
+    )
+    manager = PostgresTokenBudgetManager(
+        total_tokens_per_minute=10_000,
+        total_requests_per_minute=100,
+        session_factory=factory,
+    )
+
+    decision = await manager.acquire(
+        customer_id="d0000000-0000-0000-0000-000000000001",
+        campaign_id="c0000000-0000-0000-0000-000000000001",
+        interaction_id="f0000000-0000-0000-0000-000000000001",
+        estimated_tokens=1_500,
+    )
+
+    assert decision.allowed is False
+    assert decision.reason == "customer_or_global_tpm_exhausted"
+    assert "INSERT INTO llm_usage_ledger" not in "\n".join(sql for sql, _ in factory.session.executed)
+
+
+@pytest.mark.asyncio
+async def test_postgres_audit_writer_persists_structured_event():
+    factory = SequenceFakeSessionFactory([[]])
+    writer = PostgresAuditEventWriter(session_factory=factory)
+
+    await writer.write(
+        {
+            "event": "analysis_completed",
+            "interaction_id": "f0000000-0000-0000-0000-000000000001",
+            "customer_id": "d0000000-0000-0000-0000-000000000001",
+            "campaign_id": "c0000000-0000-0000-0000-000000000001",
+            "session_id": "b0000000-0000-0000-0000-000000000001",
+            "occurred_at": "2026-05-06T10:00:00+00:00",
+            "tokens_used": 1500,
+        }
+    )
+
+    sql, params = factory.session.executed[0]
+    assert "INSERT INTO postcall_audit_events" in sql
+    assert "CAST(:event_data_json AS jsonb)" in sql
+    assert params["event_name"] == "analysis_completed"
 
 
 def test_alert_evaluator_emits_threshold_alerts():

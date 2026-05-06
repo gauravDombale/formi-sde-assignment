@@ -53,7 +53,7 @@ Key decisions:
 
 ## 4. Rate Limit Management
 
-The scheduler enforces both requests per minute and tokens per minute. Every LLM call starts with an estimated token reservation based on measured average usage and transcript size. After the provider responds, the exact `usage.total_tokens` is committed to `llm_usage_ledger`.
+The scheduler enforces both requests per minute and tokens per minute. Every LLM call starts with an estimated token reservation based on measured average usage and transcript size. The production default is `PostgresTokenBudgetManager`: it takes an advisory transaction lock per provider/model/minute window, checks global RPM/TPM and protected customer reservations, then writes a `reserved` row to `llm_usage_ledger` before the worker is allowed to call the provider. After the provider responds, the exact `usage.total_tokens` is committed back to the same ledger row.
 
 If budget is unavailable, the task is not sent to the LLM. It is marked retryable with `next_run_at` set to the next budget window. This turns 429s into controlled queueing.
 
@@ -109,6 +109,8 @@ Every structured event includes:
 - event name, severity, timestamp
 - task id, lane, attempt, retry time, token counts, or error where relevant
 
+`AuditLogger` emits structured logs, and `PostgresAuditEventWriter` persists the same event shape into `postcall_audit_events` for replay/debugging days later. The code keeps logging and persistence separate so request paths can choose fail-open logging or fail-closed audit persistence depending on the criticality of the event.
+
 Alerts:
 
 - LLM utilization over 85% for 5 minutes.
@@ -126,7 +128,7 @@ Implemented in `data/schema.sql`:
 ```sql
 postcall_tasks(task_type, lane, status, payload, attempts, next_run_at, locked_until, last_error)
 customer_llm_budgets(customer_id, reserved_tokens_per_minute, reserved_requests_per_minute, priority_weight)
-llm_usage_ledger(interaction_id, customer_id, campaign_id, estimated_tokens, actual_tokens, status, window_start)
+llm_usage_ledger(interaction_id, customer_id, campaign_id, reservation_id, estimated_tokens, actual_tokens, status, window_start)
 postcall_audit_events(interaction_id, event_name, severity, event_data, occurred_at)
 recording_jobs(interaction_id, call_sid, status, attempts, next_poll_at, s3_key)
 customer_processing_configs(customer_id, hot_phrases, cold_phrases, crm_enabled, crm_endpoint, encryption_required)
@@ -161,14 +163,14 @@ The external webhook contract is unchanged. Internally, the endpoint now writes 
 
 ## 14. Known Weaknesses
 
-The local tests still use an in-process budget manager for deterministic rate-limit simulation. Production should back token reservations with atomic SQL updates or Redis Lua scripts plus the Postgres ledger. The current hot/cold classifier is phrase-based and customer-configurable, but a trained classifier would handle ambiguous Hinglish and domain-specific outcomes better.
+The local tests still use an in-process budget manager where deterministic rate-limit simulation is clearer, but the production default budget manager is Postgres-backed and writes token reservations to `llm_usage_ledger`. The current hot/cold classifier is phrase-based and customer-configurable, but a trained classifier would handle ambiguous Hinglish and domain-specific outcomes better.
 
 Implementation scope note: the repo now contains production-shaped, locally testable implementations for durable task claiming, recording retries, CRM webhook delivery, alert evaluation, encryption hooks, and dialler backpressure. The external integrations are intentionally generic mocks/adapters because this assessment must run locally without real CRM accounts, Grafana/Prometheus, S3/KMS, or live LLM credentials. In production I would wire these same interfaces to managed secrets, provider-specific CRM adapters, metrics exporters, and integration tests against real Postgres/Redis infrastructure.
 
 ## 15. What I Would Do With More Time
 
 1. Add transcript-size-based token estimation instead of a flat average.
-2. Persist audit events directly to `postcall_audit_events`, not just structured logs.
-3. Add dashboards for queue depth, hot-lane SLA, token burn, and recording failures.
-4. Add an integration test against real Postgres that kills a worker after claim and verifies stale-lock recovery.
-5. Add real CRM provider adapters for Salesforce, HubSpot, and webhook-based customers.
+2. Add dashboards for queue depth, hot-lane SLA, token burn, and recording failures.
+3. Add an integration test against real Postgres that kills a worker after claim and verifies stale-lock recovery.
+4. Add real CRM provider adapters for Salesforce, HubSpot, and webhook-based customers.
+5. Add a trained multilingual triage classifier behind the existing customer policy interface.
