@@ -163,6 +163,8 @@ The external webhook contract is unchanged. Internally, the endpoint now writes 
 
 The local tests still use an in-process budget manager for deterministic rate-limit simulation. Production should back token reservations with atomic SQL updates or Redis Lua scripts plus the Postgres ledger. The current hot/cold classifier is phrase-based and customer-configurable, but a trained classifier would handle ambiguous Hinglish and domain-specific outcomes better.
 
+Implementation scope note: the repo now contains production-shaped, locally testable implementations for durable task claiming, recording retries, CRM webhook delivery, alert evaluation, encryption hooks, and dialler backpressure. The external integrations are intentionally generic mocks/adapters because this assessment must run locally without real CRM accounts, Grafana/Prometheus, S3/KMS, or live LLM credentials. In production I would wire these same interfaces to managed secrets, provider-specific CRM adapters, metrics exporters, and integration tests against real Postgres/Redis infrastructure.
+
 ## 15. What I Would Do With More Time
 
 1. Add transcript-size-based token estimation instead of a flat average.
