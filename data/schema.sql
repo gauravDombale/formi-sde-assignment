@@ -79,6 +79,105 @@ CREATE INDEX idx_interactions_customer ON interactions(customer_id);
 CREATE INDEX idx_interactions_call_sid ON interactions(call_sid);
 CREATE INDEX idx_interactions_status ON interactions(status);
 
+-- Durable post-call workflow state. Workers claim rows with SELECT ... FOR
+-- UPDATE SKIP LOCKED, so a Redis/Celery restart cannot permanently lose work.
+CREATE TABLE postcall_tasks (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interaction_id UUID NOT NULL REFERENCES interactions(id),
+    customer_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+    task_type VARCHAR(50) NOT NULL,
+    lane VARCHAR(20) NOT NULL DEFAULT 'cold',
+    status VARCHAR(30) NOT NULL DEFAULT 'queued',
+    payload JSONB NOT NULL DEFAULT '{}',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    max_attempts INTEGER NOT NULL DEFAULT 10,
+    next_run_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    locked_by VARCHAR(255),
+    locked_until TIMESTAMPTZ,
+    last_error TEXT,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE UNIQUE INDEX idx_postcall_tasks_unique_live
+    ON postcall_tasks(interaction_id, task_type)
+    WHERE status NOT IN ('completed', 'dead_lettered');
+CREATE INDEX idx_postcall_tasks_ready
+    ON postcall_tasks(status, next_run_at, lane);
+CREATE INDEX idx_postcall_tasks_interaction
+    ON postcall_tasks(interaction_id);
+
+CREATE TABLE customer_llm_budgets (
+    customer_id UUID PRIMARY KEY,
+    reserved_tokens_per_minute INTEGER NOT NULL DEFAULT 0,
+    reserved_requests_per_minute INTEGER NOT NULL DEFAULT 0,
+    priority_weight INTEGER NOT NULL DEFAULT 1,
+    hot_lane_sla_seconds INTEGER NOT NULL DEFAULT 120,
+    config JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE llm_usage_ledger (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interaction_id UUID NOT NULL REFERENCES interactions(id),
+    customer_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+    provider VARCHAR(50) NOT NULL,
+    model VARCHAR(100) NOT NULL,
+    reservation_id UUID,
+    estimated_tokens INTEGER NOT NULL,
+    actual_tokens INTEGER NOT NULL DEFAULT 0,
+    request_count INTEGER NOT NULL DEFAULT 1,
+    status VARCHAR(30) NOT NULL,
+    window_start TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_llm_usage_customer_window
+    ON llm_usage_ledger(customer_id, window_start);
+CREATE INDEX idx_llm_usage_interaction
+    ON llm_usage_ledger(interaction_id);
+
+CREATE TABLE postcall_audit_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interaction_id UUID NOT NULL REFERENCES interactions(id),
+    customer_id UUID,
+    campaign_id UUID,
+    session_id UUID,
+    event_name VARCHAR(100) NOT NULL,
+    severity VARCHAR(20) NOT NULL DEFAULT 'info',
+    event_data JSONB NOT NULL DEFAULT '{}',
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_postcall_audit_interaction
+    ON postcall_audit_events(interaction_id, occurred_at);
+CREATE INDEX idx_postcall_audit_event
+    ON postcall_audit_events(event_name, occurred_at);
+
+CREATE TABLE recording_jobs (
+    interaction_id UUID PRIMARY KEY REFERENCES interactions(id),
+    call_sid VARCHAR(255) NOT NULL,
+    customer_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+    status VARCHAR(30) NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_poll_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_error TEXT,
+    recording_url TEXT,
+    s3_key VARCHAR(512),
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_recording_jobs_ready
+    ON recording_jobs(status, next_poll_at);
+
 -- Seed data: sample interactions for testing
 -- (Uses fixed UUIDs for reproducibility)
 
