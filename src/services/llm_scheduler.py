@@ -1,12 +1,13 @@
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Dict, Iterable, Optional
 from uuid import uuid4
 
 from src.config import settings
 from src.services.audit import audit_logger
+from src.services.customer_policy import CustomerProcessingPolicy, policy_from_additional_data
 from src.services.post_call_processor import AnalysisResult, PostCallContext, PostCallProcessor
 
 
@@ -175,36 +176,19 @@ class ScheduledAnalysis:
     reason: str = ""
 
 
-def classify_processing_lane(ctx: PostCallContext) -> ProcessingLane:
+def classify_processing_lane(
+    ctx: PostCallContext,
+    policy: Optional[CustomerProcessingPolicy] = None,
+) -> ProcessingLane:
+    policy = policy or policy_from_additional_data(ctx.additional_data or {})
     transcript = (ctx.conversation_data or {}).get("transcript", [])
-    if len(transcript) < 4:
+    if len(transcript) < policy.short_transcript_turns:
         return ProcessingLane.SKIP
 
     text = ctx.transcript_text.lower()
-    hot_phrases = (
-        "confirmed",
-        "book",
-        "booked",
-        "demo",
-        "appointment",
-        "schedule",
-        "reschedule",
-        "manager",
-        "escalate",
-        "complaint",
-        "unacceptable",
-    )
-    cold_phrases = (
-        "not interested",
-        "don't call",
-        "dont call",
-        "already booked",
-        "already purchased",
-        "wrong number",
-    )
-    if any(phrase in text for phrase in hot_phrases):
+    if any(phrase in text for phrase in policy.hot_phrases):
         return ProcessingLane.HOT
-    if any(phrase in text for phrase in cold_phrases):
+    if any(phrase in text for phrase in policy.cold_phrases):
         return ProcessingLane.COLD
     return ProcessingLane.COLD
 
@@ -221,7 +205,8 @@ class LLMRequestScheduler:
         self.estimated_tokens_per_call = estimated_tokens_per_call
 
     async def process_when_budget_available(self, ctx: PostCallContext) -> ScheduledAnalysis:
-        lane = classify_processing_lane(ctx)
+        policy = policy_from_additional_data(ctx.additional_data or {})
+        lane = classify_processing_lane(ctx, policy)
         audit_logger.emit(
             "analysis_classified",
             interaction_id=ctx.interaction_id,

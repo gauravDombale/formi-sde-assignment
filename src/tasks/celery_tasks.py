@@ -47,6 +47,9 @@ from src.services.metrics import metrics_tracker
 from src.services.audit import audit_logger
 from src.services.llm_scheduler import llm_scheduler
 from src.services.durable_tasks import DurableTask, durable_task_store
+from src.services.customer_policy import policy_from_additional_data
+from src.services.crm import push_crm_update
+from src.services.security import sensitive_data_protector
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +122,10 @@ async def _process_interaction(task, payload: Dict[str, Any]):
         agent_id=payload["agent_id"],
         call_sid=payload.get("call_sid", ""),
         transcript_text=payload.get("transcript_text", ""),
-        conversation_data=payload.get("conversation_data", {}),
+        conversation_data=sensitive_data_protector.reveal_json(
+            payload.get("conversation_data", {}),
+            interaction_id=interaction_id,
+        ),
         additional_data=payload.get("additional_data", {}),
         ended_at=datetime.fromisoformat(payload["ended_at"]),
         exotel_account_id=payload.get("exotel_account_id"),
@@ -177,43 +183,56 @@ async def _process_interaction(task, payload: Dict[str, Any]):
     #
     # If this raises, we log a warning and continue — the lead stage still
     # updates. But the downstream action (WhatsApp, callback, CRM push) is lost.
-    try:
-        await trigger_signal_jobs(
-            interaction_id=ctx.interaction_id,
-            session_id=ctx.session_id,
-            campaign_id=ctx.campaign_id,
-            analysis_result=result.raw_response,
-        )
-    except Exception as e:
-        audit_logger.emit(
-            "signal_jobs_failed",
-            interaction_id=ctx.interaction_id,
-            customer_id=ctx.customer_id,
-            campaign_id=ctx.campaign_id,
-            session_id=ctx.session_id,
-            error=str(e),
-            severity="warning",
-        )
+    await durable_task_store.enqueue(
+        task_id=f"signal_jobs:{ctx.interaction_id}",
+        task_type="signal_jobs",
+        interaction_id=ctx.interaction_id,
+        customer_id=ctx.customer_id,
+        campaign_id=ctx.campaign_id,
+        payload={
+            "interaction_id": ctx.interaction_id,
+            "session_id": ctx.session_id,
+            "campaign_id": ctx.campaign_id,
+            "analysis_result": result.raw_response,
+        },
+        lane=scheduled.lane,
+    )
 
     # ── Step 4: Lead stage update ─────────────────────────────────────────────
     # Updates the lead's stage in the leads table based on call_stage.
     # e.g., "rebook_confirmed" → lead moves to "booked" stage.
     # Same fire-and-forget risk as signal_jobs above.
-    try:
-        await update_lead_stage(
-            lead_id=ctx.lead_id,
-            interaction_id=ctx.interaction_id,
-            call_stage=result.call_stage,
-        )
-    except Exception as e:
-        audit_logger.emit(
-            "lead_stage_update_failed",
+    await durable_task_store.enqueue(
+        task_id=f"lead_stage:{ctx.interaction_id}",
+        task_type="lead_stage_update",
+        interaction_id=ctx.interaction_id,
+        customer_id=ctx.customer_id,
+        campaign_id=ctx.campaign_id,
+        payload={
+            "interaction_id": ctx.interaction_id,
+            "lead_id": ctx.lead_id,
+            "call_stage": result.call_stage,
+        },
+        lane=scheduled.lane,
+    )
+
+    policy = policy_from_additional_data(ctx.additional_data or {})
+    if policy.crm_enabled:
+        await durable_task_store.enqueue(
+            task_id=f"crm_push:{ctx.interaction_id}",
+            task_type="crm_push",
             interaction_id=ctx.interaction_id,
             customer_id=ctx.customer_id,
             campaign_id=ctx.campaign_id,
-            session_id=ctx.session_id,
-            error=str(e),
-            severity="warning",
+            payload={
+                "interaction_id": ctx.interaction_id,
+                "customer_id": ctx.customer_id,
+                "campaign_id": ctx.campaign_id,
+                "endpoint_url": policy.crm_endpoint,
+                "analysis_result": result.raw_response,
+                "call_stage": result.call_stage,
+            },
+            lane=scheduled.lane,
         )
 
 
@@ -223,6 +242,18 @@ async def process_durable_task(task: DurableTask) -> None:
             await _process_interaction(None, task.payload)
         elif task.task_type == "recording_upload":
             await poll_and_upload_recording(**task.payload)
+        elif task.task_type == "signal_jobs":
+            await trigger_signal_jobs(**task.payload)
+        elif task.task_type == "lead_stage_update":
+            await update_lead_stage(**task.payload)
+        elif task.task_type == "crm_push":
+            await push_crm_update(
+                interaction_id=task.payload["interaction_id"],
+                customer_id=task.customer_id,
+                campaign_id=task.campaign_id,
+                endpoint_url=task.payload.get("endpoint_url"),
+                payload=task.payload,
+            )
         else:
             raise ValueError(f"unknown durable task type: {task.task_type}")
     except Exception as e:

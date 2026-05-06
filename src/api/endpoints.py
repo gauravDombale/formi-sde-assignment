@@ -38,6 +38,7 @@ from src.services.audit import audit_logger
 from src.services.durable_tasks import durable_task_store
 from src.services.llm_scheduler import ProcessingLane, classify_processing_lane
 from src.services.post_call_processor import PostCallContext
+from src.services.security import sensitive_data_protector
 from src.tasks.celery_tasks import process_interaction_end_background_task
 
 logger = logging.getLogger(__name__)
@@ -125,7 +126,10 @@ async def end_interaction(
             "agent_id": interaction["agent_id"],
             "call_sid": request.call_sid,
             "transcript_text": transcript_text,
-            "conversation_data": interaction.get("conversation_data", {}),
+            "conversation_data": sensitive_data_protector.protect_json(
+                interaction.get("conversation_data", {}),
+                interaction_id=str(interaction_id),
+            ),
             "additional_data": request.additional_data or {},
             "ended_at": datetime.utcnow().isoformat(),
             "exotel_account_id": interaction.get("exotel_account_id"),

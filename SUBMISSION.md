@@ -28,6 +28,7 @@ Update interaction ENDED + write audit event
         |
         +--> INSERT postcall_tasks: llm_analysis
         +--> INSERT recording_jobs / postcall_tasks: recording_upload
+        +--> encrypt sensitive transcript payload when encryption key configured
         |
         v
 Durable workers claim due rows with SKIP LOCKED
@@ -40,7 +41,7 @@ Durable workers claim due rows with SKIP LOCKED
               +--> reserve global + customer budget
               +--> call LLM only after reservation
               +--> write usage ledger + analysis result + audit
-              +--> trigger downstream jobs durably
+              +--> enqueue signal, lead-stage, and CRM jobs durably
 ```
 
 Key decisions:
@@ -58,6 +59,8 @@ If budget is unavailable, the task is not sent to the LLM. It is marked retryabl
 
 Hot-lane tasks are claimed first, then cold-lane tasks. Cold tasks are allowed to drain using unallocated headroom, but cannot consume another customer's reserved allocation.
 
+The old binary circuit breaker is replaced by `get_backpressure`, which returns a proportional dialler delay based on utilization: no delay under 70%, light delay above 70%, heavier delay above 85%, and short refusal/delay only when capacity is exhausted. This avoids hardcoded 30-minute freezes.
+
 ## 5. Per-Customer Token Budgeting
 
 Let total capacity be `N` tokens/minute. Each active customer may have a reserved budget `R_customer`. The scheduler protects the unused reserved budget of every other customer before allowing one customer to use shared headroom.
@@ -68,13 +71,13 @@ If a customer exceeds its budget, new analysis tasks for that customer are defer
 
 ## 6. Differentiated Processing
 
-The first implementation uses deterministic transcript triage:
+The implementation uses deterministic transcript triage with per-customer overrides:
 
 - `skip`: fewer than 4 turns, no LLM.
 - `hot`: confirmed/rebooked/demo/scheduled/escalation/complaint signals.
 - `cold`: not interested, already done, ambiguous follow-up, or no hot signal.
 
-This is intentionally conservative. In production, the keyword triage should be customer-configurable and can later be replaced by a cheap classifier model, but the expensive full analysis still requires scheduler admission.
+`CustomerProcessingPolicy` can override hot/cold phrases, short-transcript threshold, CRM settings, and hot-lane SLA through request/customer configuration. This keeps business urgency configurable without a deployment. A cheap classifier model can replace the phrase policy later, but the expensive full analysis still requires scheduler admission.
 
 ## 7. Recording Pipeline
 
@@ -114,6 +117,8 @@ Alerts:
 - Recording failure rate over threshold.
 - Customer budget exhaustion sustained for more than 10 minutes.
 
+`PostCallAlertEvaluator` implements these thresholds as code so they can be wired to Prometheus/Grafana, a scheduled health check, or a paging integration.
+
 ## 10. Data Model
 
 Implemented in `data/schema.sql`:
@@ -124,6 +129,8 @@ customer_llm_budgets(customer_id, reserved_tokens_per_minute, reserved_requests_
 llm_usage_ledger(interaction_id, customer_id, campaign_id, estimated_tokens, actual_tokens, status, window_start)
 postcall_audit_events(interaction_id, event_name, severity, event_data, occurred_at)
 recording_jobs(interaction_id, call_sid, status, attempts, next_poll_at, s3_key)
+customer_processing_configs(customer_id, hot_phrases, cold_phrases, crm_enabled, crm_endpoint, encryption_required)
+crm_delivery_status(interaction_id, customer_id, endpoint_url, status, attempts, next_retry_at)
 ```
 
 ## 11. Security
@@ -133,6 +140,7 @@ Sensitive data includes transcripts, extracted entities, lead PII, phone numbers
 - TLS for provider, API, DB, Redis, and S3 traffic.
 - S3 SSE-KMS for recordings, with short-lived signed URLs for playback.
 - Column-level or application-layer encryption for transcript and PII fields where supported.
+- `SensitiveDataProtector` provides optional AES-256-GCM application-layer encryption for sensitive JSON payloads when `POSTCALL_ENCRYPTION_KEY_B64` is configured.
 - Strict tenant scoping on every query by `customer_id`.
 - Redacted logs: audit events should contain identifiers and status, not full transcript text.
 - Token ledger stores usage metadata, not prompt contents.
@@ -153,12 +161,12 @@ The external webhook contract is unchanged. Internally, the endpoint now writes 
 
 ## 14. Known Weaknesses
 
-The local tests still use an in-process budget manager for deterministic rate-limit simulation. Production should back token reservations with atomic SQL updates or Redis Lua scripts plus the Postgres ledger. The current hot/cold classifier is heuristic and should become customer-configurable. Downstream CRM/signal jobs still need the same durable task treatment as analysis and recordings.
+The local tests still use an in-process budget manager for deterministic rate-limit simulation. Production should back token reservations with atomic SQL updates or Redis Lua scripts plus the Postgres ledger. The current hot/cold classifier is phrase-based and customer-configurable, but a trained classifier would handle ambiguous Hinglish and domain-specific outcomes better.
 
 ## 15. What I Would Do With More Time
 
 1. Add transcript-size-based token estimation instead of a flat average.
 2. Persist audit events directly to `postcall_audit_events`, not just structured logs.
-3. Move signal jobs and CRM pushes into `postcall_tasks`.
-4. Add dashboards for queue depth, hot-lane SLA, token burn, and recording failures.
-5. Add an integration test against real Postgres that kills a worker after claim and verifies stale-lock recovery.
+3. Add dashboards for queue depth, hot-lane SLA, token burn, and recording failures.
+4. Add an integration test against real Postgres that kills a worker after claim and verifies stale-lock recovery.
+5. Add real CRM provider adapters for Salesforce, HubSpot, and webhook-based customers.

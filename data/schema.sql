@@ -120,6 +120,27 @@ CREATE TABLE customer_llm_budgets (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+CREATE TABLE customer_processing_configs (
+    customer_id UUID PRIMARY KEY,
+    hot_phrases TEXT[] NOT NULL DEFAULT ARRAY[
+        'confirmed', 'book', 'booked', 'demo', 'appointment',
+        'schedule', 'reschedule', 'manager', 'escalate',
+        'complaint', 'unacceptable'
+    ],
+    cold_phrases TEXT[] NOT NULL DEFAULT ARRAY[
+        'not interested', 'dont call', 'already booked',
+        'already purchased', 'wrong number'
+    ],
+    short_transcript_turns INTEGER NOT NULL DEFAULT 4,
+    crm_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    crm_endpoint TEXT,
+    hot_lane_sla_seconds INTEGER NOT NULL DEFAULT 120,
+    encryption_required BOOLEAN NOT NULL DEFAULT TRUE,
+    config JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
 CREATE TABLE llm_usage_ledger (
     id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     interaction_id UUID NOT NULL REFERENCES interactions(id),
@@ -177,6 +198,31 @@ CREATE TABLE recording_jobs (
 
 CREATE INDEX idx_recording_jobs_ready
     ON recording_jobs(status, next_poll_at);
+
+CREATE TABLE crm_delivery_status (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    interaction_id UUID NOT NULL REFERENCES interactions(id),
+    customer_id UUID NOT NULL,
+    campaign_id UUID NOT NULL,
+    endpoint_url TEXT,
+    status VARCHAR(30) NOT NULL DEFAULT 'queued',
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_status_code INTEGER,
+    last_error TEXT,
+    next_retry_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX idx_crm_delivery_interaction
+    ON crm_delivery_status(interaction_id);
+CREATE INDEX idx_crm_delivery_ready
+    ON crm_delivery_status(status, next_retry_at);
+
+ALTER TABLE interactions
+    ADD COLUMN IF NOT EXISTS transcript_encryption_key_id VARCHAR(255),
+    ADD COLUMN IF NOT EXISTS transcript_encryption_algorithm VARCHAR(50);
 
 -- Seed data: sample interactions for testing
 -- (Uses fixed UUIDs for reproducibility)

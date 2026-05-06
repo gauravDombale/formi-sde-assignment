@@ -56,6 +56,14 @@ class CircuitState:
     # It was intended for a half-open state that never got implemented.
 
 
+@dataclass(frozen=True)
+class BackpressureDecision:
+    allowed: bool
+    delay_seconds: float
+    capacity_ratio: float
+    reason: str
+
+
 class PostCallCircuitBreaker:
     """
     Checks whether the dialler should be allowed to make a new call.
@@ -80,37 +88,37 @@ class PostCallCircuitBreaker:
         Called by the dialler. NOT called by the post-call workers —
         they fire LLM requests unconditionally.
         """
-        state = self._states.get(agent_id)
+        decision = await self.get_backpressure(agent_id)
+        return decision.allowed
 
-        if state and state.is_open:
-            if time.time() < state.freeze_until:
-                logger.warning(
-                    "circuit_breaker_open",
-                    extra={
-                        "agent_id": agent_id,
-                        "freeze_remaining_s": round(state.freeze_until - time.time()),
-                    },
-                )
-                return False
-            # Freeze expired — reset without checking whether the underlying
-            # cause (LLM overload) has actually resolved.
-            state.is_open = False
-            state.consecutive_failures = 0
-            logger.info("circuit_breaker_closed", extra={"agent_id": agent_id})
-
+    async def get_backpressure(self, agent_id: str) -> BackpressureDecision:
+        """
+        Return a proportional dispatch delay instead of a binary 30-minute freeze.
+        Dialler callers can sleep for delay_seconds or reduce concurrency.
+        """
         current_rpm = int(await redis_client.get("llm:postcall:rpm") or 0)
         max_rpm = settings.LLM_REQUESTS_PER_MINUTE
 
-        # This is requests-per-minute, not tokens-per-minute.
-        # A campaign with long transcripts will hit the token limit first,
-        # but this check won't see it until RPM also spikes.
         usage_ratio = current_rpm / max_rpm if max_rpm > 0 else 0
 
-        if usage_ratio >= self._capacity_threshold:
-            self._trip(agent_id)
-            return False
+        if usage_ratio < 0.70:
+            return BackpressureDecision(True, 0, usage_ratio, "capacity_available")
+        if usage_ratio < 0.85:
+            return BackpressureDecision(True, 1, usage_ratio, "light_backpressure")
+        if usage_ratio < 1.0:
+            return BackpressureDecision(True, 5, usage_ratio, "heavy_backpressure")
 
-        return True
+        logger.warning(
+            "dialler_backpressure_max",
+            extra={
+                "agent_id": agent_id,
+                "current_rpm": current_rpm,
+                "max_rpm": max_rpm,
+                "capacity_ratio": usage_ratio,
+                "delay_seconds": 15,
+            },
+        )
+        return BackpressureDecision(False, 15, usage_ratio, "llm_capacity_exhausted")
 
     def _trip(self, agent_id: str):
         """

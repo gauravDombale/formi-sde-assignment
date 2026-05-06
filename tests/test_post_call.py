@@ -3,6 +3,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 
 from src.config import settings
+from src.services.alerts import PostCallAlertEvaluator, PostCallHealthSnapshot
+from src.services.circuit_breaker import PostCallCircuitBreaker
+from src.services.customer_policy import CustomerProcessingPolicy
 from src.services.llm_scheduler import (
     CustomerBudget,
     LLMRequestScheduler,
@@ -10,9 +13,11 @@ from src.services.llm_scheduler import (
     TokenBudgetManager,
     classify_processing_lane,
 )
-from src.services.durable_tasks import PostgresDurableTaskStore
+from src.services.durable_tasks import DurableTask, DurableTaskStatus, PostgresDurableTaskStore
 from src.services.post_call_processor import AnalysisResult
 from src.services.recording import RecordingPollConfig, poll_and_upload_recording
+from src.services.security import SensitiveDataProtector
+from src.tasks.celery_tasks import process_durable_task
 
 
 class ManualClock:
@@ -142,6 +147,13 @@ def test_processing_lane_uses_business_urgency(make_post_call_context):
     assert classify_processing_lane(make_post_call_context("escalation_needed")) == ProcessingLane.HOT
     assert classify_processing_lane(make_post_call_context("not_interested")) == ProcessingLane.COLD
     assert classify_processing_lane(make_post_call_context("short_call_hangup")) == ProcessingLane.SKIP
+
+
+def test_customer_policy_can_override_hot_lane_keywords(make_post_call_context):
+    ctx = make_post_call_context("hinglish_ambiguous")
+    policy = CustomerProcessingPolicy(hot_phrases=("budget tight",), cold_phrases=())
+
+    assert classify_processing_lane(ctx, policy) == ProcessingLane.HOT
 
 
 @pytest.mark.asyncio
@@ -274,3 +286,75 @@ async def test_postgres_durable_store_enqueue_uses_idempotent_task_key():
     assert params["task_id"] == "analysis:interaction-2"
     assert params["lane"] == "hot"
     assert task.id == "analysis:interaction-2"
+
+
+def test_alert_evaluator_emits_threshold_alerts():
+    evaluator = PostCallAlertEvaluator()
+    alerts = evaluator.evaluate(
+        PostCallHealthSnapshot(
+            llm_tpm_utilization=0.90,
+            llm_rpm_utilization=0.40,
+            hot_lane_p95_wait_seconds=180,
+            dead_lettered_tasks=1,
+            recording_failure_rate=0.03,
+            customer_budget_exhausted_minutes=11,
+        )
+    )
+
+    assert {alert.name for alert in alerts} == {
+        "llm_capacity_high",
+        "hot_lane_sla_breached",
+        "postcall_dead_letters_present",
+        "recording_failure_rate_high",
+        "customer_budget_exhaustion_sustained",
+    }
+
+
+@pytest.mark.asyncio
+async def test_dialler_backpressure_is_gradual():
+    breaker = PostCallCircuitBreaker()
+    with patch("src.services.circuit_breaker.redis_client.get", new=AsyncMock(return_value="425")):
+        decision = await breaker.get_backpressure("agent-1")
+
+    assert decision.allowed is True
+    assert decision.delay_seconds == 5
+    assert decision.reason == "heavy_backpressure"
+
+
+def test_sensitive_data_protector_marks_unencrypted_local_payload():
+    protector = SensitiveDataProtector(key_b64="")
+    protected = protector.protect_json({"transcript": [{"content": "PII"}]}, interaction_id="interaction-1")
+
+    assert protected["encrypted"] is False
+    assert protector.reveal_json(protected, interaction_id="interaction-1")["transcript"][0]["content"] == "PII"
+
+
+@pytest.mark.asyncio
+async def test_durable_task_processor_handles_downstream_jobs():
+    task = DurableTask(
+        id="signal_jobs:interaction-1",
+        task_type="signal_jobs",
+        interaction_id="interaction-1",
+        customer_id="customer-1",
+        campaign_id="campaign-1",
+        payload={
+            "interaction_id": "interaction-1",
+            "session_id": "session-1",
+            "campaign_id": "campaign-1",
+            "analysis_result": {"call_stage": "demo_booked"},
+        },
+        status=DurableTaskStatus.RUNNING,
+        attempts=1,
+        next_run_at=0,
+    )
+
+    with patch("src.tasks.celery_tasks.trigger_signal_jobs", new=AsyncMock()) as trigger, patch(
+        "src.tasks.celery_tasks.durable_task_store"
+    ) as store:
+        store.complete = AsyncMock()
+        store.retry = AsyncMock()
+        await process_durable_task(task)
+
+    trigger.assert_awaited_once()
+    store.complete.assert_awaited_once_with(task)
+    store.retry.assert_not_called()
